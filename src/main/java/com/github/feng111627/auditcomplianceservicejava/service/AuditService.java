@@ -51,6 +51,11 @@ public class AuditService {
         return new IngestResult(index, verdict, record.seq());
     }
 
+    /** 只判定不落账：供调用方在落账前补充校验（如非法时间戳）。 */
+    public ComplianceVerdict evaluateOnly(AuditEvent event) {
+        return ruleEngine.evaluate(event);
+    }
+
     /**
      * 按记录保存的规则版本复现当时的结论。
      * 规则已升级也不影响：只要该版本规则集仍在历史中即可复现。

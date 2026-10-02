@@ -121,15 +121,15 @@ public class AuditController {
         } catch (Exception e) {
             return rejected(index, null, "事件解析失败: " + e.getMessage());
         }
-        AuditService.IngestResult result = auditService.ingest(index, event);
         if (timestampError != null) {
-            // 时间戳非法：即使其他字段合规，也必须拒收并说明
-            List<FieldViolation> violations = new ArrayList<>(result.verdict().violations());
+            // 时间戳非法：只判定不落账，合并其他违规原因后拒收
+            ComplianceVerdict dryRun = auditService.evaluateOnly(event);
+            List<FieldViolation> violations = new ArrayList<>(dryRun.violations());
             violations.add(new FieldViolation("timestamp", "R0", timestampError));
             return new AuditService.IngestResult(index,
-                    ComplianceVerdict.rejected(violations, result.verdict().ruleVersion()), null);
+                    ComplianceVerdict.rejected(violations, dryRun.ruleVersion()), null);
         }
-        return result;
+        return auditService.ingest(index, event);
     }
 
     private AuditService.IngestResult rejected(int index, String eventId, String reason) {
