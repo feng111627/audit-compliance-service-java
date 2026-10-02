@@ -1,4 +1,15 @@
 {
   "version": "v1",
-  "rules": []
+  "rules": [
+    { "id": "R1", "type": "REQUIRED", "field": "eventId", "message": "eventId 缺失" },
+    { "id": "R2", "type": "REQUIRED", "field": "actor", "message": "操作者 actor 缺失" },
+    { "id": "R3", "type": "REQUIRED", "field": "action", "message": "动作 action 缺失" },
+    { "id": "R4", "type": "REQUIRED", "field": "resource", "message": "资源 resource 缺失" },
+    { "id": "R5", "type": "REQUIRED", "field": "result", "message": "结果 result 缺失" },
+    { "id": "R6", "type": "FORMAT", "field": "eventId", "pattern": "^[A-Za-z0-9_-]{4,64}$", "message": "eventId 格式非法（4-64位字母数字_-）" },
+    { "id": "R7", "type": "ALLOWED_VALUES", "field": "result", "values": ["SUCCESS", "FAILURE", "DENIED"], "message": "result 必须是 SUCCESS/FAILURE/DENIED" },
+    { "id": "R8", "type": "ALLOWED_VALUES", "field": "action", "values": ["READ", "CREATE", "UPDATE", "DELETE", "LOGIN", "LOGOUT", "EXPORT"], "message": "action 不在允许集合内" },
+    { "id": "R9", "type": "ALERT_WHEN", "field": "result", "values": ["FAILURE", "DENIED"], "message": "失败/拒绝类操作需要告警" },
+    { "id": "R10", "type": "ALERT_WHEN", "field": "action", "values": ["DELETE", "EXPORT"], "message": "高危动作 DELETE/EXPORT 需要告警" }
+  ]
 }
