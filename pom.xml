@@ -35,6 +35,15 @@
     <build>
         <plugins>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- 让业务测试日志直接输出到控制台，便于查看覆盖的用例与结果 -->
+                    <trimStackTrace>false</trimStackTrace>
+                    <useFile>false</useFile>
+                </configuration>
+            </plugin>
+            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>

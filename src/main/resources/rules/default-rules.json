@@ -1,0 +1,33 @@
+{
+  "version": "v1",
+  "eventSchemaVersion": "event-1.0",
+  "rules": [
+    {
+      "id": "R-DENY-PROD-DELETE",
+      "description": "任何操作者删除生产资源(prod- 前缀)均判为不合规",
+      "decision": "DENY",
+      "conditions": [
+        { "field": "action",   "op": "eq",        "value": "DELETE" },
+        { "field": "resource", "op": "startsWith", "value": "prod-" }
+      ]
+    },
+    {
+      "id": "R-DENY-ROOT-LOGIN-FAILURE",
+      "description": "root 账号登录失败判为不合规（可能存在暴力破解）",
+      "decision": "DENY",
+      "conditions": [
+        { "field": "action", "op": "eq", "value": "LOGIN" },
+        { "field": "result", "op": "eq", "value": "FAILURE" },
+        { "field": "actor",  "op": "eq", "value": "root" }
+      ]
+    },
+    {
+      "id": "R-DENY-BLOCKED-IP",
+      "description": "来源 IP 在封禁名单中判为不合规",
+      "decision": "DENY",
+      "conditions": [
+        { "field": "attributes.sourceIp", "op": "in", "value": "10.0.0.66,203.0.113.9" }
+      ]
+    }
+  ]
+}
