@@ -30,8 +30,11 @@ public class RuleEngine {
         return evaluate(event, ruleProvider.current());
     }
 
-    /** 用指定版本的规则集判定（用于历史结论复现）。 */
-    public ComplianceVerdict evaluate(AuditEvent event, RuleSet ruleSet) {
+    /**
+     * 用指定版本的规则集判定（用于历史结论复现与证据包离线核验）。
+     * 静态方法：不依赖任何 Spring 容器或规则提供者状态。
+     */
+    public static ComplianceVerdict evaluate(AuditEvent event, RuleSet ruleSet) {
         List<FieldViolation> violations = new ArrayList<>();
         boolean alert = false;
         for (Rule rule : ruleSet.rules()) {
@@ -68,7 +71,7 @@ public class RuleEngine {
         return ComplianceVerdict.of(alert ? ComplianceStatus.ALERT : ComplianceStatus.ACCEPTED, ruleSet.version());
     }
 
-    private boolean matches(Rule rule, String value) {
+    private static boolean matches(Rule rule, String value) {
         try {
             return Pattern.compile(rule.pattern()).matcher(value).matches();
         } catch (PatternSyntaxException e) {
@@ -77,7 +80,7 @@ public class RuleEngine {
     }
 
     /** 支持 actor/action/resource/result/eventId/timestamp 及 attributes.<key>。 */
-    private String fieldValue(AuditEvent event, String field) {
+    private static String fieldValue(AuditEvent event, String field) {
         if (field == null) {
             return null;
         }
@@ -97,7 +100,7 @@ public class RuleEngine {
         };
     }
 
-    private String abbreviate(String value) {
+    private static String abbreviate(String value) {
         return value.length() <= 40 ? value : value.substring(0, 40) + "...";
     }
 }

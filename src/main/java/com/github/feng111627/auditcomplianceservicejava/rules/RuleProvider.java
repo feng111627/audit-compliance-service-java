@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -40,6 +41,23 @@ public class RuleProvider {
 
     public Optional<RuleSet> byVersion(String version) {
         return Optional.ofNullable(history.get(version));
+    }
+
+    /** 当前已知的全部规则集版本（含历史版本），用于证据包内嵌规则。 */
+    public List<RuleSet> all() {
+        return List.copyOf(history.values());
+    }
+
+    /**
+     * 登记一个外部来源的规则集版本（如证据包导回时内嵌的规则）。
+     * 同版本内容必须一致，否则拒绝，保证“同版本号=同一份规则”。
+     */
+    public void register(RuleSet ruleSet) {
+        RuleSet existing = history.putIfAbsent(ruleSet.version(), ruleSet);
+        if (existing != null && !existing.equals(ruleSet)) {
+            throw new IllegalStateException("规则集版本冲突: version=" + ruleSet.version()
+                    + " 与已登记内容不一致");
+        }
     }
 
     /** 重新加载规则文件；加载成功后切换当前版本并留存历史版本。 */

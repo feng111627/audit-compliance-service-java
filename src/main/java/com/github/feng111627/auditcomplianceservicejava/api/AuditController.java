@@ -1,14 +1,21 @@
 package com.github.feng111627.auditcomplianceservicejava.api;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.github.feng111627.auditcomplianceservicejava.evidence.EvidencePackage;
+import com.github.feng111627.auditcomplianceservicejava.evidence.EvidenceService;
 import com.github.feng111627.auditcomplianceservicejava.forward.AlertForwarder;
 import com.github.feng111627.auditcomplianceservicejava.forward.DeadLetter;
 import com.github.feng111627.auditcomplianceservicejava.ledger.AuditLedger;
+import com.github.feng111627.auditcomplianceservicejava.ledger.DigestVerifier;
+import com.github.feng111627.auditcomplianceservicejava.ledger.IncrementalVerifier;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceStatus;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
+import com.github.feng111627.auditcomplianceservicejava.model.DigestCheckReport;
 import com.github.feng111627.auditcomplianceservicejava.model.FieldViolation;
+import com.github.feng111627.auditcomplianceservicejava.model.IncrementalVerificationReport;
+import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
 import com.github.feng111627.auditcomplianceservicejava.model.VerificationReport;
 import com.github.feng111627.auditcomplianceservicejava.rules.RuleProvider;
 import com.github.feng111627.auditcomplianceservicejava.service.AuditService;
@@ -38,13 +45,16 @@ public class AuditController {
     private final AuditLedger ledger;
     private final AlertForwarder forwarder;
     private final RuleProvider ruleProvider;
+    private final EvidenceService evidenceService;
 
     public AuditController(AuditService auditService, AuditLedger ledger,
-                           AlertForwarder forwarder, RuleProvider ruleProvider) {
+                           AlertForwarder forwarder, RuleProvider ruleProvider,
+                           EvidenceService evidenceService) {
         this.auditService = auditService;
         this.ledger = ledger;
         this.forwarder = forwarder;
         this.ruleProvider = ruleProvider;
+        this.evidenceService = evidenceService;
     }
 
     /** 批量接收审计事件，逐条返回结论。 */
@@ -68,6 +78,36 @@ public class AuditController {
     @GetMapping("/audit/verify")
     public VerificationReport verify() {
         return ledger.verify();
+    }
+
+    /** 生成当前留存位置的存证摘要（不阻塞并发写入）。 */
+    @GetMapping("/audit/digest")
+    public LedgerDigest digest() {
+        return ledger.digest();
+    }
+
+    /** 以上一回可信摘要为锚点，对当前账本做增量核验。 */
+    @PostMapping("/audit/verify/incremental")
+    public IncrementalVerificationReport verifyIncremental(@RequestBody LedgerDigest trustedDigest) {
+        return IncrementalVerifier.verifySince(trustedDigest, ledger.readAll());
+    }
+
+    /** 用一份存证摘要核对调用方手上的记录副本。 */
+    @PostMapping("/audit/verify/copy")
+    public DigestCheckReport checkCopy(@RequestBody CopyCheckRequest request) {
+        return DigestVerifier.check(request.digest(), request.records());
+    }
+
+    /** 导出当前全部留存为可移植证据包（含存证摘要与全部规则集版本）。 */
+    @GetMapping("/audit/evidence")
+    public EvidencePackage exportEvidence() {
+        return evidenceService.export();
+    }
+
+    /** 导入证据包：离线核验通过后落入空账本并登记历史规则集。 */
+    @PostMapping("/audit/evidence/import")
+    public VerificationReport importEvidence(@RequestBody EvidencePackage pkg) {
+        return evidenceService.importPackage(pkg);
     }
 
     /** 按记录当时的规则版本复现结论并比对。 */
@@ -149,5 +189,8 @@ public class AuditController {
 
     public record ReproduceResponse(ComplianceVerdict original, ComplianceVerdict replayed,
                                     boolean matches) {
+    }
+
+    public record CopyCheckRequest(LedgerDigest digest, List<AuditRecord> records) {
     }
 }

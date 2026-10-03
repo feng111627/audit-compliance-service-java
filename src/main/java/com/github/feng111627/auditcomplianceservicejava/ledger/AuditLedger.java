@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
+import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
 import com.github.feng111627.auditcomplianceservicejava.model.VerificationReport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,6 +63,49 @@ public class AuditLedger {
             records.add(record);
             tailHash = hash;
             return record;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 生成当前留存位置的存证摘要。只在锁内读取序号与链尾哈希（O(1)），
+     * 不等待进行中的写入；与追加共用同一把公平锁，因此每份摘要都对应
+     * 一个确定、自洽的留存位置，事后拿账本前缀核对必然对得上。
+     */
+    public LedgerDigest digest() {
+        lock.lock();
+        try {
+            return new LedgerDigest(records.size(), tailHash, Instant.now());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 把一份已通过离线核验的记录整体导入空账本（证据包导回）。
+     * 导入前重新做一次完整性校验；导入后 tailHash 接续导入链尾，
+     * 后续 append 接着原有编号继续、不重号也不断档。
+     * 非空账本拒绝导入，避免覆盖已有历史。
+     */
+    public void importVerified(List<AuditRecord> imported) {
+        lock.lock();
+        try {
+            if (!records.isEmpty()) {
+                throw new IllegalStateException("只能导入到空账本：当前已有 " + records.size() + " 条记录");
+            }
+            VerificationReport report = LedgerVerifier.verify(imported);
+            if (!report.intact()) {
+                throw new IllegalArgumentException("导入的记录未通过完整性校验: " + report.anomalies());
+            }
+            for (AuditRecord record : imported) {
+                if (persistPath != null) {
+                    appendToFile(record);
+                }
+                records.add(record);
+            }
+            tailHash = imported.isEmpty() ? RecordHasher.GENESIS : imported.get(imported.size() - 1).hash();
+            log.info("已导入 {} 条审计记录，链尾哈希接续为 {}", imported.size(), tailHash);
         } finally {
             lock.unlock();
         }

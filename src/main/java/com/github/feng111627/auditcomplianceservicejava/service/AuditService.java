@@ -65,7 +65,7 @@ public class AuditService {
         RuleSet historical = ruleProvider.byVersion(version)
                 .orElseThrow(() -> new IllegalStateException(
                         "找不到版本为 " + version + " 的历史规则集，无法复现"));
-        return ruleEngine.evaluate(record.event(), historical);
+        return RuleEngine.evaluate(record.event(), historical);
     }
 
     /** 复现结论并与记录中保存的结论比对是否一致。 */
