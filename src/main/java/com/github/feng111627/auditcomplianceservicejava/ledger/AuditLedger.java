@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
+import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
 import com.github.feng111627.auditcomplianceservicejava.model.VerificationReport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +21,7 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -37,7 +39,17 @@ public class AuditLedger {
     private final List<AuditRecord> records = new ArrayList<>();
     private final Path persistPath;
     private final ObjectMapper mapper;
+    /**
+     * 链尖快照（记录数 + 整体指纹）。只在写锁内更新，
+     * 生成摘要时无锁读取，因此并发追加再密集，
+     * 每次读到的也是一个确定、自洽的留存位置。
+     */
+    private final AtomicReference<ChainTip> tip = new AtomicReference<>(new ChainTip(0, RecordHasher.GENESIS));
     private String tailHash = RecordHasher.GENESIS;
+
+    /** 不可变的链尖状态：条数与整体指纹成对更新，杜绝读到半截状态。 */
+    private record ChainTip(long count, String tailHash) {
+    }
 
     public AuditLedger(@Value("${audit.ledger.path:}") String ledgerPath) {
         this.mapper = new ObjectMapper()
@@ -61,6 +73,7 @@ public class AuditLedger {
             }
             records.add(record);
             tailHash = hash;
+            tip.set(new ChainTip(records.size(), hash));
             return record;
         } finally {
             lock.unlock();
@@ -82,6 +95,44 @@ public class AuditLedger {
         return LedgerVerifier.verify(readAll());
     }
 
+    /**
+     * 生成当前留存位置的存证摘要。无锁读取链尖快照：
+     * 不停顿、不等待写入，并发追加下每份摘要仍对应一个确定、自洽的位置，
+     * 事后用该位置之前的记录副本核对必然对得上。
+     */
+    public LedgerDigest digest() {
+        ChainTip current = tip.get();
+        return new LedgerDigest(current.count(), current.tailHash(), Instant.now());
+    }
+
+    /**
+     * 从证据包导入一段留存（仅允许导入到空账本）。导入前做完整性校验，
+     * 导入后链尖恢复到包内位置，后续追加接着原编号继续、不重号不断档。
+     */
+    public void restore(List<AuditRecord> imported) {
+        lock.lock();
+        try {
+            if (!records.isEmpty()) {
+                throw new IllegalStateException("账本非空（当前 " + records.size()
+                        + " 条），禁止导入证据包，请用全新实例导入");
+            }
+            VerificationReport report = LedgerVerifier.verify(imported);
+            if (!report.intact()) {
+                throw new IllegalArgumentException("证据包记录完整性校验未通过: " + report.anomalies());
+            }
+            if (persistPath != null) {
+                rewriteFile(imported);
+            }
+            records.addAll(imported);
+            tailHash = imported.isEmpty() ? RecordHasher.GENESIS
+                    : imported.get(imported.size() - 1).hash();
+            tip.set(new ChainTip(records.size(), tailHash));
+            log.info("已导入 {} 条审计记录，链尖恢复到 {}", records.size(), tailHash);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public long size() {
         lock.lock();
         try {
@@ -101,6 +152,20 @@ public class AuditLedger {
         }
     }
 
+    private void rewriteFile(List<AuditRecord> all) {
+        try {
+            Files.createDirectories(persistPath.toAbsolutePath().getParent());
+            StringBuilder sb = new StringBuilder();
+            for (AuditRecord record : all) {
+                sb.append(mapper.writeValueAsString(record)).append(System.lineSeparator());
+            }
+            Files.writeString(persistPath, sb.toString(),
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            throw new UncheckedIOException("审计记录落盘失败: " + persistPath, e);
+        }
+    }
+
     private void loadFromFile() {
         if (!Files.exists(persistPath)) {
             return;
@@ -115,6 +180,7 @@ public class AuditLedger {
                 records.add(record);
                 tailHash = record.hash();
             }
+            tip.set(new ChainTip(records.size(), tailHash));
             VerificationReport report = LedgerVerifier.verify(records);
             if (!report.intact()) {
                 log.warn("从文件恢复审计账本时发现完整性异常: {}", report.anomalies());

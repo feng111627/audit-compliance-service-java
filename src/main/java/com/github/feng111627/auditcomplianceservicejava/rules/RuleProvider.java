@@ -42,6 +42,11 @@ public class RuleProvider {
         return Optional.ofNullable(history.get(version));
     }
 
+    /** 登记一份历史规则集（如从证据包导入），已存在的版本不覆盖。 */
+    public void register(RuleSet ruleSet) {
+        history.putIfAbsent(ruleSet.version(), ruleSet);
+    }
+
     /** 重新加载规则文件；加载成功后切换当前版本并留存历史版本。 */
     public synchronized void reload() {
         Resource resource = new DefaultResourceLoader().getResource(rulesLocation);

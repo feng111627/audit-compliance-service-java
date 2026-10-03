@@ -25,8 +25,16 @@ public class RuleEngine {
         this.ruleProvider = ruleProvider;
     }
 
+    /** 离线用途（如证据包独立核验）：只用 evaluate(event, ruleSet)，不依赖规则提供者。 */
+    public static RuleEngine offline() {
+        return new RuleEngine(null);
+    }
+
     /** 用当前生效的规则集判定。 */
     public ComplianceVerdict evaluate(AuditEvent event) {
+        if (ruleProvider == null) {
+            throw new IllegalStateException("离线模式没有规则提供者，请使用 evaluate(event, ruleSet)");
+        }
         return evaluate(event, ruleProvider.current());
     }
 

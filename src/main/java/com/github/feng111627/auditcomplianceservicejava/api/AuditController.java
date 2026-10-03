@@ -1,14 +1,22 @@
 package com.github.feng111627.auditcomplianceservicejava.api;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.github.feng111627.auditcomplianceservicejava.evidence.EvidenceService;
 import com.github.feng111627.auditcomplianceservicejava.forward.AlertForwarder;
 import com.github.feng111627.auditcomplianceservicejava.forward.DeadLetter;
 import com.github.feng111627.auditcomplianceservicejava.ledger.AuditLedger;
+import com.github.feng111627.auditcomplianceservicejava.ledger.DigestVerifier;
+import com.github.feng111627.auditcomplianceservicejava.ledger.LedgerVerifier;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceStatus;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
+import com.github.feng111627.auditcomplianceservicejava.model.DigestCheckReport;
+import com.github.feng111627.auditcomplianceservicejava.model.EvidencePack;
+import com.github.feng111627.auditcomplianceservicejava.model.EvidencePackReport;
 import com.github.feng111627.auditcomplianceservicejava.model.FieldViolation;
+import com.github.feng111627.auditcomplianceservicejava.model.IncrementalVerificationReport;
+import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
 import com.github.feng111627.auditcomplianceservicejava.model.VerificationReport;
 import com.github.feng111627.auditcomplianceservicejava.rules.RuleProvider;
 import com.github.feng111627.auditcomplianceservicejava.service.AuditService;
@@ -38,13 +46,16 @@ public class AuditController {
     private final AuditLedger ledger;
     private final AlertForwarder forwarder;
     private final RuleProvider ruleProvider;
+    private final EvidenceService evidenceService;
 
     public AuditController(AuditService auditService, AuditLedger ledger,
-                           AlertForwarder forwarder, RuleProvider ruleProvider) {
+                           AlertForwarder forwarder, RuleProvider ruleProvider,
+                           EvidenceService evidenceService) {
         this.auditService = auditService;
         this.ledger = ledger;
         this.forwarder = forwarder;
         this.ruleProvider = ruleProvider;
+        this.evidenceService = evidenceService;
     }
 
     /** 批量接收审计事件，逐条返回结论。 */
@@ -68,6 +79,36 @@ public class AuditController {
     @GetMapping("/audit/verify")
     public VerificationReport verify() {
         return ledger.verify();
+    }
+
+    /** 生成当前留存位置的存证摘要（无锁快照，并发追加下也自洽）。 */
+    @GetMapping("/audit/digest")
+    public LedgerDigest digest() {
+        return ledger.digest();
+    }
+
+    /** 用一份已发布的摘要核对记录副本：识别内容改动与末尾整段删减。 */
+    @PostMapping("/audit/digest/check")
+    public DigestCheckReport checkDigest(@RequestBody DigestCheckRequest request) {
+        return DigestVerifier.check(request.digest(), request.records());
+    }
+
+    /** 增量核验：从可信摘要往后只完整重算新增记录，结论与整体核验一致。 */
+    @PostMapping("/audit/verify/incremental")
+    public IncrementalVerificationReport verifyIncremental(@RequestBody IncrementalVerifyRequest request) {
+        return LedgerVerifier.verifyIncremental(request.trusted(), request.records());
+    }
+
+    /** 导出可移植证据包（含判定当时所用的规则集版本）。 */
+    @GetMapping("/audit/evidence/export")
+    public EvidencePack exportEvidence() {
+        return evidenceService.exportPack();
+    }
+
+    /** 导入证据包：先独立核验，通过后恢复记录并登记规则集历史。 */
+    @PostMapping("/audit/evidence/import")
+    public EvidencePackReport importEvidence(@RequestBody EvidencePack pack) {
+        return evidenceService.importPack(pack);
     }
 
     /** 按记录当时的规则版本复现结论并比对。 */
@@ -149,5 +190,11 @@ public class AuditController {
 
     public record ReproduceResponse(ComplianceVerdict original, ComplianceVerdict replayed,
                                     boolean matches) {
+    }
+
+    public record DigestCheckRequest(LedgerDigest digest, List<AuditRecord> records) {
+    }
+
+    public record IncrementalVerifyRequest(LedgerDigest trusted, List<AuditRecord> records) {
     }
 }
