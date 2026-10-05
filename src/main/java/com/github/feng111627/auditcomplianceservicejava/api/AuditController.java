@@ -7,7 +7,6 @@ import com.github.feng111627.auditcomplianceservicejava.forward.AlertForwarder;
 import com.github.feng111627.auditcomplianceservicejava.forward.DeadLetter;
 import com.github.feng111627.auditcomplianceservicejava.ledger.AuditLedger;
 import com.github.feng111627.auditcomplianceservicejava.ledger.DigestVerifier;
-import com.github.feng111627.auditcomplianceservicejava.ledger.IncrementalVerifier;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceStatus;
@@ -89,7 +88,7 @@ public class AuditController {
     /** 以上一回可信摘要为锚点，对当前账本做增量核验。 */
     @PostMapping("/audit/verify/incremental")
     public IncrementalVerificationReport verifyIncremental(@RequestBody LedgerDigest trustedDigest) {
-        return IncrementalVerifier.verifySince(trustedDigest, ledger.readAll());
+        return ledger.verifyIncremental(trustedDigest);
     }
 
     /** 用一份存证摘要核对调用方手上的记录副本。 */

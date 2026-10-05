@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
+import com.github.feng111627.auditcomplianceservicejava.model.IncrementalVerificationReport;
 import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
 import com.github.feng111627.auditcomplianceservicejava.model.VerificationReport;
 import org.slf4j.Logger;
@@ -39,6 +40,13 @@ public class AuditLedger {
     private final Path persistPath;
     private final ObjectMapper mapper;
     private String tailHash = RecordHasher.GENESIS;
+    /**
+     * 存储层（文件）加载时的完整性核验结论；纯内存账本或加载/导入校验通过时为 null。
+     * 记录进入账本只有三条路——加载（此时全量校验一次）、追加（账本自己算哈希，
+     * 自洽）、导入（导入前全量校验）——因此前缀完整性由账本持续维护，
+     * 增量核验无需每次重算历史，只需把该结论并入。
+     */
+    private volatile VerificationReport storageVerification;
 
     public AuditLedger(@Value("${audit.ledger.path:}") String ledgerPath) {
         this.mapper = new ObjectMapper()
@@ -105,6 +113,7 @@ public class AuditLedger {
                 records.add(record);
             }
             tailHash = imported.isEmpty() ? RecordHasher.GENESIS : imported.get(imported.size() - 1).hash();
+            storageVerification = null;
             log.info("已导入 {} 条审计记录，链尾哈希接续为 {}", imported.size(), tailHash);
         } finally {
             lock.unlock();
@@ -124,6 +133,29 @@ public class AuditLedger {
     /** 独立校验完整性：发现篡改、删除、调换并指出具体记录。 */
     public VerificationReport verify() {
         return LedgerVerifier.verify(readAll());
+    }
+
+    /**
+     * 以“上一回已确认可信”的摘要为锚点，对当前账本做增量核验。
+     * 每次调用代价 O(新增条数)：锁内取快照后由 IncrementalVerifier 做
+     * 覆盖范围结构性检查（纯字段比对）+ 新增部分完整校验；
+     * 再并入存储层加载时的一次性全量校验结论——“只改内容、哈希字段
+     * 原封不动”这类必须重算内容哈希才能发现的覆盖范围篡改由它兜底，
+     * 因此与整体核验（{@link #verify()}）对当前账本的结论一致。
+     */
+    public IncrementalVerificationReport verifyIncremental(LedgerDigest trusted) {
+        IncrementalVerificationReport base = IncrementalVerifier.verifySince(trusted, readAll());
+        VerificationReport storage = storageVerification;
+        if (storage == null || storage.intact()) {
+            return base;
+        }
+        List<String> anomalies = new ArrayList<>();
+        anomalies.add("留存存储层在加载时未通过完整性校验（覆盖范围内的历史在账本外被改动过），"
+                + "共 " + storage.anomalies().size() + " 处异常:");
+        anomalies.addAll(storage.anomalies());
+        anomalies.addAll(base.anomalies());
+        return new IncrementalVerificationReport(false, base.anchorCount(),
+                base.checkedNewCount(), base.totalCount(), List.copyOf(anomalies));
     }
 
     public long size() {
@@ -160,6 +192,7 @@ public class AuditLedger {
                 tailHash = record.hash();
             }
             VerificationReport report = LedgerVerifier.verify(records);
+            storageVerification = report.intact() ? null : report;
             if (!report.intact()) {
                 log.warn("从文件恢复审计账本时发现完整性异常: {}", report.anomalies());
             } else {

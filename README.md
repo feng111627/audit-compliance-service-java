@@ -71,17 +71,35 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
 ## 增量核验
 
 - **用法**：保存上一回已确认可信的摘要，之后
-  `POST /api/audit/verify/incremental`（或 `IncrementalVerifier.verifySince`）
-  以它为锚点核验当前账本：边界锚定（O(1)）+ 只对新增记录做完整校验，
+  `POST /api/audit/verify/incremental`（账本路径，或静态方法
+  `IncrementalVerifier.verifySince`）以它为锚点核验当前账本。
+- **代价只随新增增长**：每次核验 = 覆盖范围 O(k) 结构性检查（纯字段比对，
+  不重算哈希）+ 边界锚定 O(1) + 只对新增记录做完整校验，
   哈希计算代价为 **O(新增条数)**，不随历史总长线性重算全量。
-- **结论与整体核验一致**：诚实账本与新增部分的篡改/断档/乱序/末尾缺失，
-  增量核验与 `LedgerVerifier` 整体核验结论一致（有逐场景测试）。
-- **不漏掉更早历史被改**：摘要指纹是对全部历史的链式承诺，任何对前 k 条的
-  改动——即使把后续哈希全部重算伪装成自洽（整体核验都发现不了）——都会让
-  第 k 条哈希偏离锚点，边界比对立即失败。
+- **覆盖范围内能发现哪些改动**（结构性检查 + 锚点，均定位到具体 seq/位置与条数）：
+  - 两条记录被互换、序号被改、记录被删除/插入 → 序号连续性检查暴露；
+  - 内容被改、且这条自己的校验码（hash）被一并改对 → 它与后一条之间的
+    链式衔接必然断裂，prevHash 衔接检查暴露；
+  - hash/prevHash 字段被直接改动 → 衔接检查或锚点比对暴露；
+  - 整段历史被重算伪装成自洽（整体核验都发现不了）→ 第 k 条哈希偏离
+    可信锚点，边界比对立即失败。
+- **“只改内容、所有哈希字段原封不动”怎么兜底**：这种改法在字段层面不留
+  任何不一致，任何核验器都必须重算内容哈希才能发现，无法用 O(新增) 的
+  静态检查覆盖。账本路径由**存储层加载时的一次性全量校验**兜底：记录进入
+  账本只有三条路——启动加载（此时全量校验一次并记住结论）、追加（账本自己
+  算哈希，自洽）、证据包导入（导入前全量校验）——`AuditLedger.verifyIncremental`
+  把加载结论并入增量核验结果，因此对**当前账本**，增量核验与整体核验的结论
+  始终一致，而每次核验的开销仍是 O(新增条数)。
+- **结论与整体核验一致**：诚实账本、覆盖范围内的上述改动、新增部分的
+  篡改/断档/乱序/末尾缺失，增量核验与 `LedgerVerifier` 整体核验结论一致
+  （有逐场景测试）。注意方向：整体核验能发现的，增量核验一定能发现；
+  反过来增量核验凭可信摘要还能发现整体核验发现不了的“整链重算伪装”。
+- **对脱离账本的副本**：静态 `verifySince` 覆盖上述结构性异常；副本若被
+  “只改内容、哈希字段不动”地篡改，请用 `LedgerVerifier` 整体核验或
+  `POST /api/audit/verify/copy`（`DigestVerifier`，做全量校验）核对。
 - **适用范围与前提**：
   - 所用摘要必须**来源可信**（上一回生成时已确认前缀完好，且摘要本身未被调包）；
-    增量核验把“前 k 条可信”作为前提，只对新发生的变化负责。
+    增量核验把“摘要覆盖的前 k 条在生成摘要时是完好的”作为前提，对之后发生的变化负责。
   - 末尾缺失只能发现“少于摘要覆盖范围”的部分；摘要之后新增又被整段删掉的，
     需用更新后的摘要才能约束——所以应在每个核验周期结束时重新生成并妥善保存摘要。
   - 锚点为 `count=0`（空账本摘要）时，增量核验退化为整体核验，逐条等价。
@@ -166,6 +184,30 @@ curl -s -X POST localhost:8081/api/audit/evidence/import \
   -H 'Content-Type: application/json' -d @evidence.json
 ```
 
+本地复现“摘要覆盖范围内的历史被改 → 增量核验必须发现”：
+
+```bash
+# 1. 以落盘模式启动（记录追加写入 ./data/ledger.jsonl）
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8080 --audit.ledger.path=./data/ledger.jsonl"
+
+# 2. 灌入几条事件，保存当前可信摘要
+curl -s -X POST localhost:8080/api/audit/events -H 'Content-Type: application/json' -d '[
+  {"eventId":"evt-0001","actor":"alice","action":"READ","resource":"doc-1","result":"SUCCESS","timestamp":"2026-10-02T01:00:00Z"}
+]'
+curl -s localhost:8080/api/audit/digest > digest.json
+
+# 3. 停掉服务，用编辑器直接改 ./data/ledger.jsonl 中摘要覆盖范围内的某一行
+#    （比如把 actor 改掉，行里的 hash 字段不动），再按同样参数重启
+
+# 4. 增量核验与整体核验给出一致结论：都报异常且定位到同一条
+curl -s -X POST localhost:8080/api/audit/verify/incremental \
+  -H 'Content-Type: application/json' -d @digest.json   # intact=false，指出存储层发现的 seq
+curl -s localhost:8080/api/audit/verify                 # intact=false，定位相同
+
+# 5. 自动化复现（覆盖范围内改内容/改内容并改对校验码/两条互换/一致性汇总）
+mvn test -Dtest=IncrementalPrefixTamperingTest
+```
+
 ## 本地验证（测试覆盖）
 
 `mvn test` 的日志按 `[业务覆盖] / [用例] / [结果]` 打印，覆盖：
@@ -180,6 +222,7 @@ curl -s -X POST localhost:8081/api/audit/evidence/import \
 | `DigestConsistencyTest` | 摘要与账本一致；8 线程并发追加 800 条时连续生成 200 份摘要，每份都对应最终账本的真实前缀位置且增量核验完好 |
 | `DigestCopyCheckTest` | 完整副本核对一致；末尾整段删减被发现并说清缺失 seq 范围；内容篡改、重算链伪装均被指纹比对识破 |
 | `IncrementalVerificationTest` | 增量核验只算新增部分且结论与整体核验一致；历史被重算伪装时凭可信锚点发现；末尾缺失被定位；count=0 锚点等价整体核验 |
+| `IncrementalPrefixTamperingTest` | 摘要覆盖范围内：改内容并把校验码改对、两条互换均被静态增量核验检出并定位；落盘文件被只改内容后重启，账本增量核验凭存储层校验检出；四类场景增量与整体核验结论一致；诚实账本完好 |
 | `EvidencePackageTest` | 证据包导出后离线核验通过；篡改结论被检出；导回新实例接着 seq 续写不重号不断档、结论按当时规则复现一致；篡改包/非空账本拒绝导入 |
 | `EvidenceApiTest` | REST 全链路：空实例导入外部证据包→续写→摘要→增量核验→副本核对→导出→重复导入被拒 |
 | `ApiIntegrationTest` | 本地起服务全链路：批量接收→留存→校验→异步转发→复现 |
