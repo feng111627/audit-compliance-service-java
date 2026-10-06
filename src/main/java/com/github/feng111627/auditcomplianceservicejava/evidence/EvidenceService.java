@@ -1,6 +1,7 @@
 package com.github.feng111627.auditcomplianceservicejava.evidence;
 
 import com.github.feng111627.auditcomplianceservicejava.ledger.AuditLedger;
+import com.github.feng111627.auditcomplianceservicejava.ledger.MmrAccumulator;
 import com.github.feng111627.auditcomplianceservicejava.ledger.RecordHasher;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
@@ -61,10 +62,12 @@ public class EvidenceService {
         return report;
     }
 
-    /** 由一份记录快照推出其存证摘要（条数 + 链尾指纹）。 */
+    /** 由一份记录快照推出其存证摘要（条数 + 链尾指纹 + MMR 山尖）。 */
     public static LedgerDigest digestOf(List<AuditRecord> records) {
         String tail = records.isEmpty()
                 ? RecordHasher.GENESIS : records.get(records.size() - 1).hash();
-        return new LedgerDigest(records.size(), tail, Instant.now());
+        List<String> recordHashes = records.stream().map(AuditRecord::hash).toList();
+        return new LedgerDigest(records.size(), tail, Instant.now(),
+                MmrAccumulator.peaksFor(recordHashes));
     }
 }

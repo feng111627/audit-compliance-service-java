@@ -90,7 +90,9 @@ class DigestConsistencyTest {
             assertEquals(actualHashAtPosition, d.tailHash(),
                     "每份摘要都必须对应最终账本中一个真实、自洽的前缀位置: count=" + d.recordCount());
             assertTrue(IncrementalVerifier.verifySince(d, finalRecords).intact(),
-                    "以该摘要为锚点对最终账本做增量核验必须完好: count=" + d.recordCount());
+                    "以该摘要为锚点对最终账本做增量核验（线下整体重算路径）必须完好: count=" + d.recordCount());
+            assertTrue(ledger.verifyIncremental(d).intact(),
+                    "以该摘要为锚点的锁内快速路径增量核验必须完好: count=" + d.recordCount());
         }
         TestLog.pass("200 份摘要全部对应最终账本的真实前缀位置，且以其为锚点的增量核验全部完好");
     }

@@ -1,6 +1,7 @@
 package com.github.feng111627.auditcomplianceservicejava.evidence;
 
 import com.github.feng111627.auditcomplianceservicejava.ledger.LedgerVerifier;
+import com.github.feng111627.auditcomplianceservicejava.ledger.MmrAccumulator;
 import com.github.feng111627.auditcomplianceservicejava.ledger.RecordHasher;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
@@ -58,6 +59,18 @@ public final class EvidenceVerifier {
             if (!actualTail.equals(pkg.digest().tailHash())) {
                 anomalies.add("摘要整体指纹不符: 摘要承诺 " + pkg.digest().tailHash()
                         + "，记录实际链尾 " + actualTail);
+            }
+            // 新格式摘要携带 MMR 山尖：山尖形状必须与条数一致，取值必须能由记录重算出来
+            if (pkg.digest().peaks() != null && !pkg.digest().peaks().isEmpty()) {
+                if (!MmrAccumulator.isValidShape(pkg.digest().peaks(), records.size())) {
+                    anomalies.add("摘要 MMR 山尖形状与记录条数 " + records.size() + " 不一致，摘要已损坏或被调包");
+                } else {
+                    List<String> actualPeaks = MmrAccumulator.peaksFor(
+                            records.stream().map(AuditRecord::hash).toList());
+                    if (!actualPeaks.equals(pkg.digest().peaks())) {
+                        anomalies.add("摘要 MMR 山尖与记录重算结果不符: 记录的位置承诺与摘要承诺的不是同一份内容");
+                    }
+                }
             }
         }
 

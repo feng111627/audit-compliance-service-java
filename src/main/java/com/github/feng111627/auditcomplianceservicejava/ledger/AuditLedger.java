@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditEvent;
 import com.github.feng111627.auditcomplianceservicejava.model.AuditRecord;
 import com.github.feng111627.auditcomplianceservicejava.model.ComplianceVerdict;
+import com.github.feng111627.auditcomplianceservicejava.model.IncrementalVerificationReport;
 import com.github.feng111627.auditcomplianceservicejava.model.LedgerDigest;
 import com.github.feng111627.auditcomplianceservicejava.model.VerificationReport;
 import org.slf4j.Logger;
@@ -39,6 +40,14 @@ public class AuditLedger {
     private final Path persistPath;
     private final ObjectMapper mapper;
     private String tailHash = RecordHasher.GENESIS;
+    /** 与 records/tailHash 同锁维护的 MMR 山尖累加器，山尖随追加摊还 O(1)/条更新。 */
+    private final MmrAccumulator mmr = new MmrAccumulator();
+    /**
+     * 从持久化文件恢复时全量核验发现的异常（只改内容不换自带哈希这类
+     * 山尖无法承诺的形态，只能靠启动时一次全量重算发现）。进程生命周期内
+     * 常量，增量核验会把它并入结论，保证文件被改后增量核验与整体核验一致。
+     */
+    private volatile List<String> bootAnomalies = List.of();
 
     public AuditLedger(@Value("${audit.ledger.path:}") String ledgerPath) {
         this.mapper = new ObjectMapper()
@@ -62,6 +71,7 @@ public class AuditLedger {
             }
             records.add(record);
             tailHash = hash;
+            mmr.append(hash);
             return record;
         } finally {
             lock.unlock();
@@ -69,14 +79,44 @@ public class AuditLedger {
     }
 
     /**
-     * 生成当前留存位置的存证摘要。只在锁内读取序号与链尾哈希（O(1)），
-     * 不等待进行中的写入；与追加共用同一把公平锁，因此每份摘要都对应
-     * 一个确定、自洽的留存位置，事后拿账本前缀核对必然对得上。
+     * 生成当前留存位置的存证摘要。只在锁内读取序号、链尾哈希与 MMR 山尖
+     * （均为 O(log n) 个山尖的快照），不等待进行中的写入；与追加共用同一把
+     * 公平锁，因此每份摘要都对应一个确定、自洽的留存位置（记录、链尾、
+     * 山尖三者同一个提交点），事后拿账本前缀核对必然对得上。
      */
     public LedgerDigest digest() {
         lock.lock();
         try {
-            return new LedgerDigest(records.size(), tailHash, Instant.now());
+            return new LedgerDigest(records.size(), tailHash, Instant.now(), mmr.peaksHighToLow());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 锁内增量核验：在同一把公平锁内一次性取得“当前山尖 + 记录快照”，
+     * 二者必然对应同一个留存位置，核验结论确定、自洽，并发追加不会让
+     * 锚点与记录各对应半个状态。诚实账本下只对新增记录做哈希追加
+     * （≤2×新增次数），不随历史总长重算。
+     */
+    public IncrementalVerificationReport verifyIncremental(LedgerDigest trusted) {
+        lock.lock();
+        try {
+            IncrementalVerificationReport report =
+                    IncrementalVerifier.verifySince(trusted, List.copyOf(records), mmr.peaksHighToLow());
+            if (bootAnomalies.isEmpty()) {
+                return report;
+            }
+            // 启动全量核验已发现的历史异常（如持久化文件中只改内容不换哈希）必须并入结论；
+            // 同一条明细可能两条路径都报，按出现顺序去重
+            List<String> all = new ArrayList<>(bootAnomalies);
+            for (String a : report.anomalies()) {
+                if (!all.contains(a)) {
+                    all.add(a);
+                }
+            }
+            return new IncrementalVerificationReport(false, report.anchorCount(),
+                    report.checkedNewCount(), report.totalCount(), List.copyOf(all));
         } finally {
             lock.unlock();
         }
@@ -103,6 +143,7 @@ public class AuditLedger {
                     appendToFile(record);
                 }
                 records.add(record);
+                mmr.append(record.hash());
             }
             tailHash = imported.isEmpty() ? RecordHasher.GENESIS : imported.get(imported.size() - 1).hash();
             log.info("已导入 {} 条审计记录，链尾哈希接续为 {}", imported.size(), tailHash);
@@ -158,9 +199,11 @@ public class AuditLedger {
                 AuditRecord record = mapper.readValue(line, AuditRecord.class);
                 records.add(record);
                 tailHash = record.hash();
+                mmr.append(record.hash());
             }
             VerificationReport report = LedgerVerifier.verify(records);
             if (!report.intact()) {
+                bootAnomalies = List.copyOf(report.anomalies());
                 log.warn("从文件恢复审计账本时发现完整性异常: {}", report.anomalies());
             } else {
                 log.info("从 {} 恢复 {} 条审计记录，完整性校验通过", persistPath, records.size());

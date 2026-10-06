@@ -95,6 +95,45 @@ class IncrementalVerificationTest {
     }
 
     @Test
+    void earlierHistoryContentChangeWithOwnHashFixedIsNotMissed() {
+        TestLog.caseStart("覆盖范围内 seq=3 内容被改且把自身校验码一并改对（不重算其后链）：不得漏报");
+        List<AuditRecord> original = ledger.readAll();
+        AuditRecord r3 = original.get(2);
+        AuditEvent forged = ChainTools.actorTampered(r3, "mallory");
+        List<AuditRecord> tampered = ChainTools.changeContentAndRehashSelf(original, 2, forged);
+        assertEquals(com.github.feng111627.auditcomplianceservicejava.ledger.RecordHasher.hashOf(tampered.get(2)),
+                tampered.get(2).hash(), "攻击前提：seq=3 自身校验码已被改对");
+        boolean fullIntact = LedgerVerifier.verify(tampered).intact();
+        assertFalse(fullIntact, "整体核验能在 seq=4 看出链断裂");
+
+        // 线下路径（整体重算+锚定）
+        IncrementalVerificationReport offline = IncrementalVerifier.verifySince(trustedDigest, tampered);
+        assertFalse(offline.intact(), "旧实现只核边界第 5 条会漏报，修复后线下路径必须发现");
+        assertEquals(fullIntact, offline.intact(), "结论必须与整体核验一致");
+        // 账本锁内快速路径（MMR 山尖位置承诺）
+        IncrementalVerificationReport live = ledger.verifyIncremental(trustedDigest);
+        assertTrue(live.intact(), "未被改的活账本仍应完好");
+        TestLog.pass("覆盖范围内中间记录被改（自身校验码改对）：线下路径定位到 seq=4 断链，与整体核验一致");
+    }
+
+    @Test
+    void earlierHistorySwapIsNotMissed() {
+        TestLog.caseStart("覆盖范围内 seq=2 与 seq=3 两条被整体互换：不得漏报，指出两个位置");
+        List<AuditRecord> swapped = ChainTools.swapWholeRecords(ledger.readAll(), 1, 2);
+        boolean fullIntact = LedgerVerifier.verify(swapped).intact();
+        assertFalse(fullIntact, "整体核验能看出乱序/断链");
+
+        IncrementalVerificationReport inc = IncrementalVerifier.verifySince(trustedDigest, swapped);
+        assertFalse(inc.intact(), "旧实现只核边界第 5 条会漏报，修复后必须发现互换");
+        assertEquals(fullIntact, inc.intact(), "结论必须与整体核验一致");
+        assertTrue(inc.anomalies().stream().anyMatch(a -> a.contains("seq=2") && a.contains("seq=3")),
+                "应指出互换的两个位置: " + inc.anomalies());
+        assertTrue(inc.anomalies().stream().anyMatch(a -> a.contains("哈希链断裂")),
+                "应有断链明细: " + inc.anomalies());
+        TestLog.pass("覆盖范围内两条互换被检出，定位 seq=2/seq=3，与整体核验结论一致");
+    }
+
+    @Test
     void tailTruncationIsDetected() {
         TestLog.caseStart("可信摘要覆盖到 seq=10 后末尾整段删掉 3 条：增量核验发现缺失并说清缺了哪些");
         LedgerDigest trustedAt10 = ledger.digest();

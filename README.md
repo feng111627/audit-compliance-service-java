@@ -55,12 +55,15 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
 
 ## 存证摘要（可保存、可对外发布）
 
-- **摘要语义**：`GET /api/audit/digest` 返回 `{recordCount, tailHash, generatedAt}`，
-  含义是“截止到这一刻，账本共 `recordCount` 条，整体指纹为 `tailHash`”。
-  `tailHash` 即第 `recordCount` 条记录的链尾哈希，隐式承诺了全部历史内容。
-- **不停写、自洽位置**：摘要生成只在公平锁内读取序号与链尾哈希（O(1)），不等待
-  进行中的写入；与追加共用同一把锁，因此并发追加下每份摘要都对应一个确定、自洽的
-  留存位置——事后拿账本前 `recordCount` 条核对必然对得上（有并发测试佐证）。
+- **摘要语义**：`GET /api/audit/digest` 返回 `{recordCount, tailHash, generatedAt, peaks}`，
+  含义是“截止到这一刻，账本共 `recordCount` 条，链尾指纹为 `tailHash`，位置指纹为 `peaks`”。
+  `tailHash` 是第 `recordCount` 条记录的链尾哈希，承诺链式衔接；`peaks` 是 MMR
+  （Merkle Mountain Range）山尖集（高度从高到低排列，形状只由 `recordCount` 决定），
+  逐位置承诺每个山尖覆盖段内的记录——任何一段里某条记录被改（哪怕把自身校验码也改对）、
+  两条记录位置被互换，对应山尖都会变。
+- **不停写、自洽位置**：摘要生成只在公平锁内读取序号、链尾与山尖（O(log n) 个山尖快照），
+  不等待进行中的写入；与追加共用同一把锁，因此并发追加下每份摘要都对应一个确定、自洽的
+  留存位置——记录、链尾、山尖是同一个提交点，事后拿账本前缀核对必然对得上（有并发测试佐证）。
 - **核对副本**：任何人拿着摘要和一份记录副本，用 `DigestVerifier.check(digest, copy)`
   （或 `POST /api/audit/verify/copy`）即可独立核对：
   - 副本前 `recordCount` 条的链尾哈希 == 摘要指纹 → 两边是同一份内容；
@@ -71,20 +74,80 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
 ## 增量核验
 
 - **用法**：保存上一回已确认可信的摘要，之后
-  `POST /api/audit/verify/incremental`（或 `IncrementalVerifier.verifySince`）
-  以它为锚点核验当前账本：边界锚定（O(1)）+ 只对新增记录做完整校验，
-  哈希计算代价为 **O(新增条数)**，不随历史总长线性重算全量。
-- **结论与整体核验一致**：诚实账本与新增部分的篡改/断档/乱序/末尾缺失，
-  增量核验与 `LedgerVerifier` 整体核验结论一致（有逐场景测试）。
-- **不漏掉更早历史被改**：摘要指纹是对全部历史的链式承诺，任何对前 k 条的
-  改动——即使把后续哈希全部重算伪装成自洽（整体核验都发现不了）——都会让
-  第 k 条哈希偏离锚点，边界比对立即失败。
+  `POST /api/audit/verify/incremental`（或 `AuditLedger.verifyIncremental`）
+  以它为锚点核验当前账本。服务端在**同一把公平锁内**同时取“当前 MMR 山尖 + 记录快照”，
+  二者必然对应同一个留存位置，并发追加不会让结论横跨半个状态。
+- **能发现哪些更早的改动（修复后）**：从可信旧山尖出发，只对新增的 m 条做 MMR 追加
+  （每条 1 次叶子哈希、生命周期内至多 1 次父节点合并，总哈希数为 **2m+O(log k)**，
+  不随历史总长 k 线性重算），再逐山尖与当前山尖比对：
+  - 摘要覆盖范围内**中间某条记录内容被改，即使把该条自身携带的校验码也重算成能对上**
+    （但没重算其后的链）→ 该条所在山尖失配，定位到具体 seq，并指出其后一条 prevHash 断链；
+  - 覆盖范围内**两条记录整体互换位置**（自带的 seq/hash 原样跟着走）→ 山尖位置承诺识破，
+    指出涉及的两个位置、乱序与断链明细；
+  - 改动后把整条哈希链重算成自洽伪装（整体核验单看看不出来）→ 山尖/链尾锚点仍然不符。
+  一句话：**整体核验能发现的，增量核验都能发现；同一批记录两者结论一致。**
+- **定位信息**：山尖先粗定位到覆盖段（哪一段、落在历史内/跨锚点/新增段、多少条），
+  再只对失配段与新增段的并集重放与整体核验同口径的三项检查（序号、内容重算哈希、
+  prevHash），收窄到精确的 seq 区间与逐条明细；异常定位的额外重算只在发现问题时付出。
 - **适用范围与前提**：
   - 所用摘要必须**来源可信**（上一回生成时已确认前缀完好，且摘要本身未被调包）；
-    增量核验把“前 k 条可信”作为前提，只对新发生的变化负责。
+    增量核验把“前 k 条的记录自带哈希未变”作为山尖承诺。快速路径要求**当前山尖由账本
+    锁内提供**（服务端接口即如此），不能取自不受信的被核副本本身。
+  - “只改内容、不换记录自带校验码”这种形态在活账本内存里不可能发生（记录由锁内追加、
+    追加后不可变）；它只可能出现在**持久化文件离线期间被改**的场景。配置
+    `audit.ledger.path` 时，账本启动会做一次全量核验，发现的异常会并入之后的增量核验
+    结论，因此文件被改后增量核验仍与整体核验一致（有重启场景测试佐证）。
+  - 拿着摘要核对手上的**不受信记录副本**时（`IncrementalVerifier.verifySince(digest,
+    records)` 两参入口、或 `POST /api/audit/verify/copy`），因为副本可能“只改内容不换
+    校验码”，必须对副本整体重算一次（O(副本总长)），这是信息论决定的，不属于线上
+    周期增量核验路径；线上请走账本锁内快速路径。
+  - 无 MMR 山尖的旧格式摘要（`peaks` 为空）会回退为一次整体核验（结论不漏报），
+    重新生成并保存带山尖的新摘要后即恢复只随新增计费；锚点为 `count=0` 时增量核验
+    等价于整体核验。
   - 末尾缺失只能发现“少于摘要覆盖范围”的部分；摘要之后新增又被整段删掉的，
     需用更新后的摘要才能约束——所以应在每个核验周期结束时重新生成并妥善保存摘要。
-  - 锚点为 `count=0`（空账本摘要）时，增量核验退化为整体核验，逐条等价。
+
+### 本地怎么复现这次修复的漏报、怎么验证
+
+```bash
+# 跑全部测试，日志按 [业务覆盖]/[用例]/[结果] 打印
+mvn test
+
+# 只看本次漏报相关场景（覆盖：中间记录被改含校验码一并改对、两条互换、
+# 增量与整体结论一致、不误伤诚实账本、开销只随新增增长、并发确定性、文件重启兜底）
+mvn -Dtest=IncrementalTamperCoverageTest,IncrementalVerificationTest test
+```
+
+关键测试在 `IncrementalTamperCoverageTest`：
+`middleRecordContentChangedWithOwnHashRecomputedIsDetected`（中间记录被改+自身校验码
+改对）、`twoRecordsSwappedInsideCoveredHistoryIsDetected`（覆盖范围内两条互换）、
+`incrementalAndFullAgreeAcrossAllMutationScenarios`（7 种篡改下增量与整体结论一致）、
+`honestLedgerStaysIntact`（诚实账本不误伤）、`hashWorkGrowsOnlyWithNewRecords`
+（1000 与 99900 条历史下同样新增 100 条，追加哈希数相同）、
+`concurrentAppendsAndVerificationsAlwaysLandOnSelfConsistentPosition`（并发确定性）、
+`middleRecordContentChangedKeepingHashIsDetected`（文件被改+重启兜底）。
+
+手工端到端复现：
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8080 --audit.ledger.path=./data/ledger.jsonl"
+
+# 1. 写入若干条并保存可信摘要（此时 peaks 与 tailHash 都在摘要里）
+for i in 1 2 3 4 5; do
+  curl -s -X POST localhost:8080/api/audit/events -H 'Content-Type: application/json' \
+    -d "[{\"eventId\":\"evt-000$i\",\"actor\":\"alice\",\"action\":\"READ\",\"resource\":\"doc-$i\",\"result\":\"SUCCESS\",\"timestamp\":\"2026-10-02T00:00:0$iZ\"}]" >/dev/null
+done
+curl -s localhost:8080/api/audit/digest | tee digest.json
+
+# 2. 再追加几条新增
+for i in 6 7 8; do
+  curl -s -X POST localhost:8080/api/audit/events -H 'Content-Type: application/json' \
+    -d "[{\"eventId\":\"evt-000$i\",\"actor\":\"alice\",\"action\":\"READ\",\"resource\":\"doc-$i\",\"result\":\"SUCCESS\",\"timestamp\":\"2026-10-02T00:00:1$iZ\"}]" >/dev/null
+done
+# 3. 停服，直接改 data/ledger.jsonl 里某一条的内容（模拟离线篡改），再启动，增量核验必报异常并定位
+curl -s -X POST localhost:8080/api/audit/verify/incremental \
+  -H 'Content-Type: application/json' -d @digest.json
+```
 
 ## 证据包（可移植、可离线核验、可导回续写）
 
@@ -150,7 +213,7 @@ curl -X POST localhost:8080/api/audit/events -H 'Content-Type: application/json'
 # 1. 生成并保存当前存证摘要
 curl -s localhost:8080/api/audit/digest | tee digest.json
 
-# 2. 之后任何时候做增量核验（只重算新增部分）
+# 2. 之后任何时候做增量核验（锁内快速路径：只对新增部分做 MMR 追加，不重算历史）
 curl -s -X POST localhost:8080/api/audit/verify/incremental \
   -H 'Content-Type: application/json' -d @digest.json
 
@@ -179,7 +242,9 @@ curl -s -X POST localhost:8081/api/audit/evidence/import \
 | `RuleReproductionTest` | 规则 v1→v2 升级后，历史记录仍按 v1 复现出当时结论 |
 | `DigestConsistencyTest` | 摘要与账本一致；8 线程并发追加 800 条时连续生成 200 份摘要，每份都对应最终账本的真实前缀位置且增量核验完好 |
 | `DigestCopyCheckTest` | 完整副本核对一致；末尾整段删减被发现并说清缺失 seq 范围；内容篡改、重算链伪装均被指纹比对识破 |
-| `IncrementalVerificationTest` | 增量核验只算新增部分且结论与整体核验一致；历史被重算伪装时凭可信锚点发现；末尾缺失被定位；count=0 锚点等价整体核验 |
+| `IncrementalVerificationTest` | 增量核验只算新增部分且结论与整体核验一致；历史被重算伪装时凭可信锚点发现；覆盖范围内中间记录被改（含自身校验码改对）/两条互换均不漏报并定位；末尾缺失被定位；count=0 锚点等价整体核验 |
+| `IncrementalTamperCoverageTest` | 漏报复盘：覆盖范围内篡改（自身校验码改对/不改）、两条互换、跨界互换、新增段篡改、整链重算伪装共 7 种场景与整体核验结论一致；诚实账本不误伤；哈希开销 2m+O(log k) 不随历史增长；并发追加+持续核验结论对应确定位置；文件被改后重启由启动全量核验兜底 |
+| `IncrementalDifferentialRandomTest` | 30 个随机账本 × 随机锚点/篡改位置/形态共 50 个用例，快速路径与整体核验结论始终一致、无漏报 |
 | `EvidencePackageTest` | 证据包导出后离线核验通过；篡改结论被检出；导回新实例接着 seq 续写不重号不断档、结论按当时规则复现一致；篡改包/非空账本拒绝导入 |
 | `EvidenceApiTest` | REST 全链路：空实例导入外部证据包→续写→摘要→增量核验→副本核对→导出→重复导入被拒 |
 | `ApiIntegrationTest` | 本地起服务全链路：批量接收→留存→校验→异步转发→复现 |
